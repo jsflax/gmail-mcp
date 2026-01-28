@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+
+# Sensitive files - don't commit
+credentials.json
+token.json
+access_tokens.json
+clients.json
+
+# Logs
+*.log
+stdout.log
+stderr.log

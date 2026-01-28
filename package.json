@@ -1,0 +1,28 @@
+{
+  "name": "gmail-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Gmail access",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "gmail-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "auth": "tsc && node dist/auth.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "express": "^4.21.0",
+    "googleapis": "^144.0.0",
+    "open": "^10.1.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
