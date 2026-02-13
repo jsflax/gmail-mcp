@@ -16,8 +16,13 @@
     <key>WorkingDirectory</key>
     <string>__INSTALL_DIR__</string>
     <key>StandardOutPath</key>
-    <string>__INSTALL_DIR__/stdout.log</string>
+    <string>__HOME__/.config/gmail-mcp/stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>__INSTALL_DIR__/stderr.log</string>
+    <string>__HOME__/.config/gmail-mcp/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
 </dict>
 </plist>

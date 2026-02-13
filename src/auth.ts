@@ -10,48 +10,46 @@ import { google } from 'googleapis';
 import { createServer } from 'http';
 import { URL } from 'url';
 import open from 'open';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const CONFIG_DIR = join(__dirname, '..');
+const CONFIG_DIR = join(homedir(), '.config', 'gmail-mcp');
+mkdirSync(CONFIG_DIR, { recursive: true });
 const CREDENTIALS_PATH = join(CONFIG_DIR, 'credentials.json');
 const TOKEN_PATH = join(CONFIG_DIR, 'token.json');
+
+const DEFAULT_GOOGLE_CREDENTIALS = {
+  client_id: '52009412064-k1u1a1n7k0hdaolgtkjnm9q03iq945ds.apps.googleusercontent.com',
+  client_secret: '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',
+};
 
 const SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
   'https://www.googleapis.com/auth/gmail.modify',
 ];
 
-interface Credentials {
-  installed?: {
-    client_id: string;
-    client_secret: string;
-    redirect_uris: string[];
-  };
-  web?: {
-    client_id: string;
-    client_secret: string;
-    redirect_uris: string[];
-  };
-}
-
 async function authenticate(): Promise<void> {
-  // Check for credentials file
-  if (!existsSync(CREDENTIALS_PATH)) {
-    console.error('Error: credentials.json not found.');
-    console.error('');
-    console.error('To set up credentials:');
-    console.error('1. Go to https://console.cloud.google.com/apis/credentials');
-    console.error('2. Create an OAuth 2.0 Client ID (Desktop app type)');
-    console.error('3. Download the JSON and save it as credentials.json in this directory');
-    process.exit(1);
-  }
+  let client_id: string;
+  let client_secret: string;
 
-  const content = readFileSync(CREDENTIALS_PATH, 'utf-8');
-  const credentials: Credentials = JSON.parse(content);
-  const { client_id, client_secret } = credentials.installed || credentials.web || {};
+  if (existsSync(CREDENTIALS_PATH)) {
+    try {
+      const credentials = JSON.parse(readFileSync(CREDENTIALS_PATH, 'utf-8'));
+      const creds = credentials.installed || credentials.web;
+      client_id = creds?.client_id;
+      client_secret = creds?.client_secret;
+    } catch {
+      client_id = DEFAULT_GOOGLE_CREDENTIALS.client_id;
+      client_secret = DEFAULT_GOOGLE_CREDENTIALS.client_secret;
+    }
+  } else {
+    console.log('Using built-in Google OAuth credentials.');
+    console.log('(To use your own, place a credentials.json in ' + CONFIG_DIR + ')');
+    console.log('');
+    client_id = DEFAULT_GOOGLE_CREDENTIALS.client_id;
+    client_secret = DEFAULT_GOOGLE_CREDENTIALS.client_secret;
+  }
 
   if (!client_id || !client_secret) {
     console.error('Error: Invalid credentials.json format');
@@ -124,7 +122,7 @@ async function authenticate(): Promise<void> {
   // Save tokens
   writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
   console.log('');
-  console.log('Authentication successful! Tokens saved to token.json');
+  console.log(`Authentication successful! Tokens saved to ${TOKEN_PATH}`);
   console.log('');
   console.log('You can now use the Gmail MCP server.');
 }

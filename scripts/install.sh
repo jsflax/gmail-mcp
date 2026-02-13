@@ -34,6 +34,7 @@ mkdir -p "$LAUNCH_AGENTS_DIR"
 echo "Installing LaunchAgent..."
 sed -e "s|__NODE_PATH__|$NODE_PATH|g" \
     -e "s|__INSTALL_DIR__|$REPO_DIR|g" \
+    -e "s|__HOME__|$HOME|g" \
     "$REPO_DIR/com.gmail-mcp.plist" > "$LAUNCH_AGENTS_DIR/$PLIST_NAME"
 
 # Unload if already loaded
@@ -46,5 +47,5 @@ echo ""
 echo "Done! Gmail MCP server installed and running."
 echo ""
 echo "To check status:  curl http://localhost:3100/health"
-echo "To view logs:     tail -f $REPO_DIR/stderr.log"
+echo "To view logs:     tail -f ~/.config/gmail-mcp/stderr.log"
 echo "To uninstall:     ./scripts/uninstall.sh"

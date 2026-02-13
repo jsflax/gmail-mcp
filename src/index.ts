@@ -17,21 +17,31 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { google, gmail_v1 } from 'googleapis';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const CONFIG_DIR = join(__dirname, '..');
+const CONFIG_DIR = join(homedir(), '.config', 'gmail-mcp');
+mkdirSync(CONFIG_DIR, { recursive: true });
 const CREDENTIALS_PATH = join(CONFIG_DIR, 'credentials.json');
 const TOKEN_PATH = join(CONFIG_DIR, 'token.json');
 const CLIENTS_PATH = join(CONFIG_DIR, 'clients.json');
 const TOKENS_PATH = join(CONFIG_DIR, 'access_tokens.json');
 
-const PORT = 3100;
+const PORT = parseInt(process.env.PORT || '3100', 10);
 const SERVER_URL = `http://localhost:${PORT}`;
+
+// Default Google OAuth credentials (Desktop app — safe to embed, see Google's public client docs).
+// Users can override by placing their own credentials.json in ~/.config/gmail-mcp/
+const DEFAULT_GOOGLE_CREDENTIALS = {
+  client_id: '52009412064-k1u1a1n7k0hdaolgtkjnm9q03iq945ds.apps.googleusercontent.com',
+  client_secret: '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',
+  redirect_uris: ['http://localhost:3000/callback'],
+  auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+  token_uri: 'https://oauth2.googleapis.com/token',
+};
 
 const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
@@ -69,7 +79,7 @@ interface AccessToken {
 const registeredClients = new Map<string, RegisteredClient>();
 const authorizationCodes = new Map<string, AuthorizationCode>();
 const accessTokens = new Map<string, AccessToken>();
-const pendingAuths = new Map<string, { client_id: string; redirect_uri: string; state?: string; code_challenge?: string; code_challenge_method?: string }>();
+const pendingAuths = new Map<string, { client_id: string; redirect_uri: string; state?: string; code_challenge?: string; code_challenge_method?: string; expires_at: number }>();
 
 // Load persisted clients
 function loadClients() {
@@ -117,9 +127,19 @@ loadTokens();
 // Google OAuth Helpers
 // ============================================================================
 
+function getGoogleCredentials() {
+  if (existsSync(CREDENTIALS_PATH)) {
+    try {
+      const credentials = JSON.parse(readFileSync(CREDENTIALS_PATH, 'utf-8'));
+      const creds = credentials.installed || credentials.web;
+      if (creds?.client_id && creds?.client_secret) return creds;
+    } catch {}
+  }
+  return DEFAULT_GOOGLE_CREDENTIALS;
+}
+
 function getGoogleOAuth2Client() {
-  const credentials = JSON.parse(readFileSync(CREDENTIALS_PATH, 'utf-8'));
-  const { client_id, client_secret } = credentials.installed || credentials.web || {};
+  const { client_id, client_secret } = getGoogleCredentials();
   return new google.auth.OAuth2(
     client_id,
     client_secret,
@@ -131,23 +151,36 @@ function isGoogleAuthenticated(): boolean {
   if (!existsSync(TOKEN_PATH)) return false;
   try {
     const tokens = JSON.parse(readFileSync(TOKEN_PATH, 'utf-8'));
-    return !!tokens.access_token;
+    // Need either a valid access token or a refresh token to obtain one
+    if (tokens.refresh_token) return true;
+    if (tokens.access_token && tokens.expiry_date && Date.now() < tokens.expiry_date) return true;
+    return false;
   } catch {
     return false;
   }
 }
 
 function getGmailClient(): gmail_v1.Gmail {
-  if (!existsSync(CREDENTIALS_PATH)) {
-    throw new Error('credentials.json not found.');
-  }
   if (!existsSync(TOKEN_PATH)) {
-    throw new Error('Not authenticated with Google.');
+    throw new Error('Not authenticated with Google. Re-authenticate via Claude Code /mcp menu.');
   }
 
   const tokens = JSON.parse(readFileSync(TOKEN_PATH, 'utf-8'));
   const oauth2Client = getGoogleOAuth2Client();
   oauth2Client.setCredentials(tokens);
+
+  // Persist refreshed tokens so they survive server restarts
+  oauth2Client.on('tokens', (newTokens) => {
+    try {
+      const existing = existsSync(TOKEN_PATH)
+        ? JSON.parse(readFileSync(TOKEN_PATH, 'utf-8'))
+        : {};
+      writeFileSync(TOKEN_PATH, JSON.stringify({ ...existing, ...newTokens }, null, 2));
+      console.log('Google tokens refreshed and saved to disk');
+    } catch (err) {
+      console.error('Failed to persist refreshed Google tokens:', err);
+    }
+  });
 
   return google.gmail({ version: 'v1', auth: oauth2Client });
 }
@@ -244,6 +277,107 @@ const tools: Tool[] = [
         threadId: { type: 'string', description: 'The ID of the thread to retrieve' },
       },
       required: ['threadId'],
+    },
+  },
+  {
+    name: 'send_email',
+    description: 'Compose and send a new email.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        to: { type: 'string', description: 'Recipient email address (comma-separated for multiple)' },
+        subject: { type: 'string', description: 'Email subject line' },
+        body: { type: 'string', description: 'Email body (plain text)' },
+        cc: { type: 'string', description: 'CC recipients (comma-separated)' },
+        bcc: { type: 'string', description: 'BCC recipients (comma-separated)' },
+      },
+      required: ['to', 'subject', 'body'],
+    },
+  },
+  {
+    name: 'reply_to_email',
+    description: 'Reply to an existing email. Sends the reply in the same thread.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        emailId: { type: 'string', description: 'The ID of the email to reply to' },
+        body: { type: 'string', description: 'Reply body (plain text)' },
+        replyAll: { type: 'boolean', description: 'Reply to all recipients (default: false)' },
+      },
+      required: ['emailId', 'body'],
+    },
+  },
+  {
+    name: 'draft_email',
+    description: 'Create a draft email without sending it.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        to: { type: 'string', description: 'Recipient email address (comma-separated for multiple)' },
+        subject: { type: 'string', description: 'Email subject line' },
+        body: { type: 'string', description: 'Email body (plain text)' },
+        cc: { type: 'string', description: 'CC recipients (comma-separated)' },
+        bcc: { type: 'string', description: 'BCC recipients (comma-separated)' },
+      },
+      required: ['to', 'subject', 'body'],
+    },
+  },
+  {
+    name: 'archive_email',
+    description: 'Archive an email (remove from inbox).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        emailId: { type: 'string', description: 'The ID of the email to archive' },
+      },
+      required: ['emailId'],
+    },
+  },
+  {
+    name: 'trash_email',
+    description: 'Move an email to trash.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        emailId: { type: 'string', description: 'The ID of the email to trash' },
+      },
+      required: ['emailId'],
+    },
+  },
+  {
+    name: 'add_label',
+    description: 'Add a label to an email.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        emailId: { type: 'string', description: 'The ID of the email' },
+        labelId: { type: 'string', description: 'The label ID to add (use list_labels to find IDs)' },
+      },
+      required: ['emailId', 'labelId'],
+    },
+  },
+  {
+    name: 'remove_label',
+    description: 'Remove a label from an email.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        emailId: { type: 'string', description: 'The ID of the email' },
+        labelId: { type: 'string', description: 'The label ID to remove (use list_labels to find IDs)' },
+      },
+      required: ['emailId', 'labelId'],
+    },
+  },
+  {
+    name: 'get_attachment',
+    description: 'Download an email attachment. Returns the filename, MIME type, and base64-encoded content.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        emailId: { type: 'string', description: 'The ID of the email containing the attachment' },
+        attachmentId: { type: 'string', description: 'The attachment ID (from read_email response). If not provided, lists all attachments.' },
+      },
+      required: ['emailId'],
     },
   },
 ];
@@ -370,6 +504,147 @@ async function getThread(args: { threadId: string }): Promise<string> {
   return JSON.stringify({ threadId: response.data.id, messageCount: messages?.length, messages }, null, 2);
 }
 
+function buildRawEmail(headers: Record<string, string>, body: string): string {
+  const lines = Object.entries(headers)
+    .filter(([, v]) => v)
+    .map(([k, v]) => `${k}: ${v}`);
+  lines.push('Content-Type: text/plain; charset="UTF-8"');
+  lines.push('MIME-Version: 1.0');
+  lines.push('');
+  lines.push(body);
+  return Buffer.from(lines.join('\r\n')).toString('base64url');
+}
+
+async function sendEmail(args: { to: string; subject: string; body: string; cc?: string; bcc?: string }): Promise<string> {
+  const gmail = getGmailClient();
+  const raw = buildRawEmail({
+    To: args.to,
+    Subject: args.subject,
+    Cc: args.cc || '',
+    Bcc: args.bcc || '',
+  }, args.body);
+
+  const response = await gmail.users.messages.send({
+    userId: 'me',
+    requestBody: { raw },
+  });
+
+  return JSON.stringify({ status: 'sent', id: response.data.id, threadId: response.data.threadId }, null, 2);
+}
+
+async function replyToEmail(args: { emailId: string; body: string; replyAll?: boolean }): Promise<string> {
+  const gmail = getGmailClient();
+
+  // Fetch the original message to get headers
+  const original = await gmail.users.messages.get({ userId: 'me', id: args.emailId, format: 'metadata', metadataHeaders: ['From', 'To', 'Cc', 'Subject', 'Message-ID'] });
+  const headers = original.data.payload?.headers;
+  const from = getHeader(headers, 'From');
+  const to = getHeader(headers, 'To');
+  const cc = getHeader(headers, 'Cc');
+  const subject = getHeader(headers, 'Subject');
+  const messageId = getHeader(headers, 'Message-ID');
+
+  const replyTo = args.replyAll ? [from, ...to.split(',')].filter(Boolean).join(', ') : from;
+  const replyCc = args.replyAll ? cc : '';
+
+  const raw = buildRawEmail({
+    To: replyTo,
+    Cc: replyCc,
+    Subject: subject.startsWith('Re:') ? subject : `Re: ${subject}`,
+    'In-Reply-To': messageId,
+    References: messageId,
+  }, args.body);
+
+  const response = await gmail.users.messages.send({
+    userId: 'me',
+    requestBody: { raw, threadId: original.data.threadId! },
+  });
+
+  return JSON.stringify({ status: 'sent', id: response.data.id, threadId: response.data.threadId }, null, 2);
+}
+
+async function draftEmail(args: { to: string; subject: string; body: string; cc?: string; bcc?: string }): Promise<string> {
+  const gmail = getGmailClient();
+  const raw = buildRawEmail({
+    To: args.to,
+    Subject: args.subject,
+    Cc: args.cc || '',
+    Bcc: args.bcc || '',
+  }, args.body);
+
+  const response = await gmail.users.drafts.create({
+    userId: 'me',
+    requestBody: { message: { raw } },
+  });
+
+  return JSON.stringify({ status: 'drafted', id: response.data.id, messageId: response.data.message?.id }, null, 2);
+}
+
+async function archiveEmail(args: { emailId: string }): Promise<string> {
+  const gmail = getGmailClient();
+  await gmail.users.messages.modify({ userId: 'me', id: args.emailId, requestBody: { removeLabelIds: ['INBOX'] } });
+  return `Email ${args.emailId} archived.`;
+}
+
+async function trashEmail(args: { emailId: string }): Promise<string> {
+  const gmail = getGmailClient();
+  await gmail.users.messages.trash({ userId: 'me', id: args.emailId });
+  return `Email ${args.emailId} moved to trash.`;
+}
+
+async function addLabel(args: { emailId: string; labelId: string }): Promise<string> {
+  const gmail = getGmailClient();
+  await gmail.users.messages.modify({ userId: 'me', id: args.emailId, requestBody: { addLabelIds: [args.labelId] } });
+  return `Label ${args.labelId} added to email ${args.emailId}.`;
+}
+
+async function removeLabel(args: { emailId: string; labelId: string }): Promise<string> {
+  const gmail = getGmailClient();
+  await gmail.users.messages.modify({ userId: 'me', id: args.emailId, requestBody: { removeLabelIds: [args.labelId] } });
+  return `Label ${args.labelId} removed from email ${args.emailId}.`;
+}
+
+function findAttachments(payload: gmail_v1.Schema$MessagePart, results: { filename: string; mimeType: string; attachmentId: string; size: number }[] = []): typeof results {
+  if (payload.filename && payload.body?.attachmentId) {
+    results.push({
+      filename: payload.filename,
+      mimeType: payload.mimeType || 'application/octet-stream',
+      attachmentId: payload.body.attachmentId,
+      size: payload.body.size || 0,
+    });
+  }
+  if (payload.parts) {
+    for (const part of payload.parts) findAttachments(part, results);
+  }
+  return results;
+}
+
+async function getAttachment(args: { emailId: string; attachmentId?: string }): Promise<string> {
+  const gmail = getGmailClient();
+  const message = await gmail.users.messages.get({ userId: 'me', id: args.emailId, format: 'full' });
+  const attachments = findAttachments(message.data.payload!);
+
+  if (!attachments.length) return 'No attachments found in this email.';
+
+  if (!args.attachmentId) {
+    return JSON.stringify({ emailId: args.emailId, attachments: attachments.map(({ filename, mimeType, attachmentId, size }) => ({ filename, mimeType, attachmentId, size })) }, null, 2);
+  }
+
+  const meta = attachments.find(a => a.attachmentId === args.attachmentId);
+  const response = await gmail.users.messages.attachments.get({
+    userId: 'me',
+    messageId: args.emailId,
+    id: args.attachmentId,
+  });
+
+  return JSON.stringify({
+    filename: meta?.filename,
+    mimeType: meta?.mimeType,
+    size: response.data.size,
+    data: response.data.data, // base64url-encoded
+  }, null, 2);
+}
+
 // ============================================================================
 // MCP Server
 // ============================================================================
@@ -394,6 +669,14 @@ function createMcpServer(): Server {
         case 'mark_as_unread': result = await markAsUnread(args as any); break;
         case 'list_labels': result = await listLabels(); break;
         case 'get_thread': result = await getThread(args as any); break;
+        case 'send_email': result = await sendEmail(args as any); break;
+        case 'reply_to_email': result = await replyToEmail(args as any); break;
+        case 'draft_email': result = await draftEmail(args as any); break;
+        case 'archive_email': result = await archiveEmail(args as any); break;
+        case 'trash_email': result = await trashEmail(args as any); break;
+        case 'add_label': result = await addLabel(args as any); break;
+        case 'remove_label': result = await removeLabel(args as any); break;
+        case 'get_attachment': result = await getAttachment(args as any); break;
         default: throw new Error(`Unknown tool: ${name}`);
       }
       return { content: [{ type: 'text', text: result }] };
@@ -415,9 +698,39 @@ async function main() {
 
   const transports = new Map<string, SSEServerTransport>();
 
+  // --------------------------------------------------------------------------
+  // Token Validation Middleware (defined early, used by /messages and /sse)
+  // --------------------------------------------------------------------------
+  function validateToken(req: Request, res: Response, next: () => void) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader?.startsWith('Bearer ')) {
+      res.status(401)
+        .set('WWW-Authenticate', `Bearer resource_metadata="${SERVER_URL}/.well-known/oauth-protected-resource"`)
+        .json({ error: 'unauthorized' });
+      return;
+    }
+
+    const token = authHeader.slice(7);
+    const tokenData = accessTokens.get(token);
+
+    if (!tokenData || Date.now() > tokenData.expires_at) {
+      if (tokenData) {
+        accessTokens.delete(token);
+        saveTokens();
+      }
+      res.status(401)
+        .set('WWW-Authenticate', `Bearer error="invalid_token"`)
+        .json({ error: 'invalid_token' });
+      return;
+    }
+
+    next();
+  }
+
   // Messages endpoint MUST be defined BEFORE json middleware
   // The SSE transport needs to read the raw body
-  app.post('/messages', async (req, res) => {
+  app.post('/messages', validateToken, async (req, res) => {
     const sessionId = req.query.sessionId as string;
     const transport = transports.get(sessionId);
 
@@ -542,6 +855,7 @@ async function main() {
       state,
       code_challenge,
       code_challenge_method: code_challenge_method || 'plain',
+      expires_at: Date.now() + 10 * 60 * 1000, // 10 minutes
     });
 
     // Check if already authenticated with Google
@@ -727,36 +1041,6 @@ async function main() {
   });
 
   // --------------------------------------------------------------------------
-  // Token Validation Middleware
-  // --------------------------------------------------------------------------
-  function validateToken(req: Request, res: Response, next: () => void) {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader?.startsWith('Bearer ')) {
-      res.status(401)
-        .set('WWW-Authenticate', `Bearer resource_metadata="${SERVER_URL}/.well-known/oauth-protected-resource"`)
-        .json({ error: 'unauthorized' });
-      return;
-    }
-
-    const token = authHeader.slice(7);
-    const tokenData = accessTokens.get(token);
-
-    if (!tokenData || Date.now() > tokenData.expires_at) {
-      if (tokenData) {
-        accessTokens.delete(token);
-        saveTokens();
-      }
-      res.status(401)
-        .set('WWW-Authenticate', `Bearer error="invalid_token"`)
-        .json({ error: 'invalid_token' });
-      return;
-    }
-
-    next();
-  }
-
-  // --------------------------------------------------------------------------
   // SSE Endpoint (Protected)
   // --------------------------------------------------------------------------
   app.get('/sse', validateToken, async (req, res) => {
@@ -796,10 +1080,24 @@ async function main() {
   });
 
   // --------------------------------------------------------------------------
+  // Periodic cleanup of expired auth state
+  // --------------------------------------------------------------------------
+  const cleanupInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [key, code] of authorizationCodes) {
+      if (now > code.expires_at) authorizationCodes.delete(key);
+    }
+    for (const [key, auth] of pendingAuths) {
+      if (now > auth.expires_at) pendingAuths.delete(key);
+    }
+  }, 60_000);
+
+  // --------------------------------------------------------------------------
   // Start Server
   // --------------------------------------------------------------------------
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`Gmail MCP server running at ${SERVER_URL}`);
+    console.log(`Config directory: ${CONFIG_DIR}`);
     console.log(`Google auth status: ${isGoogleAuthenticated() ? 'authenticated' : 'not authenticated'}`);
     console.log(`Registered clients: ${registeredClients.size}`);
     console.log(`\nOAuth endpoints:`);
@@ -807,6 +1105,27 @@ async function main() {
     console.log(`  Token:         ${SERVER_URL}/oauth/token`);
     console.log(`  Registration:  ${SERVER_URL}/oauth/register`);
   });
+
+  // --------------------------------------------------------------------------
+  // Graceful Shutdown
+  // --------------------------------------------------------------------------
+  function shutdown() {
+    console.log('\nShutting down...');
+    clearInterval(cleanupInterval);
+    for (const [id, transport] of transports) {
+      try { transport.close?.(); } catch {}
+      transports.delete(id);
+    }
+    server.close(() => {
+      console.log('Server stopped.');
+      process.exit(0);
+    });
+    // Force exit after 5 seconds if connections don't close
+    setTimeout(() => process.exit(0), 5000);
+  }
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
 main().catch(console.error);

@@ -1,0 +1,10 @@
+src/
+scripts/
+com.gmail-mcp.plist
+tsconfig.json
+.gitignore
+*.log
+credentials.json
+token.json
+access_tokens.json
+clients.json
